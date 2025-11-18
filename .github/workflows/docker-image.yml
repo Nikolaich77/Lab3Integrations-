@@ -1,0 +1,275 @@
+name: Train, Package and Publish Speech Commands API
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ main, master ]
+  push:
+    branches: [ main, master ]
+
+# Щоб пушити в GHCR, потрібні права на пакети
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: speech-commands-api
+  REGISTRY: ghcr.io
+  PY_VERSION: '3.11'
+  TRAIN_TAG: ${{ github.sha }}-train
+  INFER_TAG: ${{ github.sha }}
+
+jobs:
+  train:
+    name: Build trainer image and run training
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Patch training for CI (epochs=1, batch=16)
+        run: |
+          sed -i 's/^EPOCHS\s*=\s*10/EPOCHS = 1/' speech_commands_train.py || true
+          sed -i 's/^BATCH_SIZE\s*=\s*64/BATCH_SIZE = 16/' speech_commands_train.py || true
+
+      - name: Prepare Dockerfile for training (CPU)
+        run: |
+          mkdir -p docker
+      cat > docker/Trainer.Dockerfile <<'EOF'
+      # syntax=docker/dockerfile:1.4
+      ARG PY_VERSION
+      FROM python:${PY_VERSION}-slim
+      ENV DEBIAN_FRONTEND=noninteractive \
+        PIP_NO_CACHE_DIR=1 \
+        PYTHONUNBUFFERED=1
+      RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash libsndfile1 sox ffmpeg \
+        && rm -rf /var/lib/apt/lists/*
+      WORKDIR /app
+      COPY requirements.txt ./
+      RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+        pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt && \
+        pip install --no-cache-dir soundfile==0.12.1
+      COPY . .
+      # За замовчуванням образ лише містить залежності та код; тренування виконується на етапі `docker run`
+      CMD ["bash","-lc","python -u speech_commands_train.py | tee train.log"]
+      EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build trainer image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Trainer.Dockerfile
+          tags: ${{ env.IMAGE_NAME }}-train:${{ env.TRAIN_TAG }}
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PY_VERSION=${{ env.PY_VERSION }}
+
+      - name: Run training container and collect artifacts
+        id: run-train
+        run: |
+          CID=train-${{ github.run_id }}
+          docker run -d --name $CID ${{ env.IMAGE_NAME }}-train:${{ env.TRAIN_TAG }}
+          # stream logs while running
+          docker logs -f $CID &
+          EXIT_CODE=$(docker wait $CID)
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          mkdir -p artifacts
+          docker cp $CID:/app/model_state_dict.pt artifacts/ || true
+          docker cp $CID:/app/model_scripted.pt artifacts/ || true
+          docker cp $CID:/app/train.log artifacts/ || true
+          docker rm -f $CID || true
+          ls -lah artifacts || true
+
+      - name: Fail if training failed
+        if: steps.run-train.outputs.exit_code != '0'
+        run: exit 1
+
+      - name: Upload training artifacts (model, logs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-artifacts
+          path: |
+            artifacts/model_state_dict.pt
+            artifacts/model_scripted.pt
+            artifacts/train.log
+          if-no-files-found: warn
+
+  verify-model:
+    name: Verify model integrity (sanity check)
+    runs-on: ubuntu-latest
+    needs: train
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts
+
+      - name: Set up Python ${{ env.PY_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install minimal deps (CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu torch==2.1.0+cpu torchaudio==2.1.0+cpu soundfile==0.12.1
+
+      - name: Run quick forward pass and write verification.json
+        run: |
+          python - <<'PY'
+          import json, torch
+          from pathlib import Path
+          from model_utils import SmallCNN
+          model_path = Path('artifacts/model_state_dict.pt')
+          assert model_path.exists(), 'model_state_dict.pt missing'
+          device = torch.device('cpu')
+          model = SmallCNN(n_classes=4)
+          model.load_state_dict(torch.load(model_path, map_location=device))
+          model.eval()
+          x = torch.randn(1,1,64,32)
+          with torch.no_grad():
+            y = model(x)
+          ok = y.shape == (1,4)
+          Path('artifacts').mkdir(exist_ok=True)
+          Path('artifacts/verification.json').write_text(json.dumps({
+            'ok': bool(ok),
+            'output_shape': list(y.shape),
+          }, indent=2))
+          print('Verification OK:', ok)
+          PY
+
+      - name: Upload verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification
+          path: artifacts/verification.json
+
+  build-inference:
+    name: Build and optionally push inference image
+    runs-on: ubuntu-latest
+    needs: [train]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download model artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts
+
+      - name: Create inference Dockerfile (CPU)
+        run: |
+          mkdir -p docker
+          cat > docker/Inference.Dockerfile <<'EOF'
+          # syntax=docker/dockerfile:1.4
+          ARG PY_VERSION
+          FROM python:${PY_VERSION}-slim
+          ENV DEBIAN_FRONTEND=noninteractive \
+              PYTHONUNBUFFERED=1 \
+              PIP_NO_CACHE_DIR=1
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                bash libsndfile1 sox ffmpeg \
+              && rm -rf /var/lib/apt/lists/*
+          WORKDIR /app
+          COPY requirements.txt ./requirements.txt
+          RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+              pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt && \
+              pip install --no-cache-dir soundfile==0.12.1
+          COPY app.py model_utils.py ./
+          COPY templates/ ./templates/
+          # Копіюємо натреновану модель у образ
+          COPY artifacts/model_state_dict.pt ./model_state_dict.pt
+          # Запуск Flask API
+          EXPOSE 8000
+          CMD ["python", "app.py"]
+          EOF
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build inference image
+        id: build-infer
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Inference.Dockerfile
+          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.INFER_TAG }}
+            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            PY_VERSION=${{ env.PY_VERSION }}
+
+      - name: Save image as tar (artifact) when not pushing
+        if: ${{ !(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
+        run: |
+          docker save ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.INFER_TAG }} -o inference-image.tar
+
+      - name: Upload inference image artifact (tar)
+        if: ${{ !(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: inference-image-tar
+          path: inference-image.tar
+
+  measure-latency:
+    name: Measure latency and upload metrics
+    runs-on: ubuntu-latest
+    needs: [build-inference]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download model artifacts (for reference)
+        uses: actions/download-artifact@v4
+        with:
+          name: model-artifacts
+          path: artifacts
+
+      - name: Pull image (if pushed)
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.INFER_TAG }}
+
+      - name: Run container and compute latency metrics
+        run: |
+          IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ env.INFER_TAG }}
+          # Якщо образ не у реєстрі (PR), спробуємо локальний тег
+          if ! docker inspect "$IMAGE" > /dev/null 2>&1; then
+            IMAGE=${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:latest
+          fi
+          if ! docker inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "Falling back to locally built image"
+            IMAGE=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep '${{ env.IMAGE_NAME }}' | head -n1)
+          fi
+          mkdir -p metrics
+          docker run --rm -v "$PWD/metrics:/metrics" "$IMAGE" bash -lc "python - <<'PY' \nimport json, csv, torch\nfrom pathlib import Path\nfrom model_utils import SmallCNN\nmodel = SmallCNN(n_classes=4)\nmodel.load_state_dict(torch.load('model_state_dict.pt', map_location='cpu'))\nmodel.eval()\nexample = torch.randn(1,1,64,32)\n# warmup\nfor _ in range(3):\n    _ = model(example)\nimport time\nN=30\nt=[]\nwith torch.no_grad():\n    for _ in range(N):\n        s=time.time(); _=model(example); e=time.time(); t.append((e-s)*1000)\nlat_ms=sum(t)/len(t)\nPath('/metrics/metrics.json').write_text(json.dumps({'latency_ms':lat_ms,'runs':N}, indent=2))\nwith open('/metrics/metrics.csv','w',newline='') as f:\n    w=csv.writer(f); w.writerow(['metric','value']); w.writerow(['latency_ms',lat_ms])\nprint('Latency (ms):',lat_ms)\nPY"
+
+      - name: Upload metrics artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-metrics
+          path: metrics
+
+# Примітка: щоб блокувати merge в master/main при падінні пайплайну, ввімкніть Branch protection rules і додайте обов'язковий статус чек цього workflow.
