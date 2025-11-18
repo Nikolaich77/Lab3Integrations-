@@ -1,0 +1,8 @@
+flask==2.2.5
+numpy==1.25.2
+requests==2.31.0
+torch==2.1.0+cpu
+torchaudio==2.1.0+cpu
+soundfile==0.12.1
+
+
