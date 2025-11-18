@@ -192,8 +192,8 @@ jobs:
               pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cpu -r requirements.txt && \
               pip install --no-cache-dir soundfile==0.12.1
           COPY app.py model_utils.py ./
-          # Копіюємо templates (якщо існує в контексті)
-          COPY templates ./templates 2>/dev/null || mkdir -p ./templates
+          # Копіюємо templates директорію для Flask
+          COPY templates ./templates
           # Копіюємо натреновану модель у образ
           COPY artifacts/model_state_dict.pt ./model_state_dict.pt
           # Запуск Flask API
