@@ -1,4 +1,4 @@
-name: Speech Commands API
+name: Train, Package and Publish Speech Commands API
 
 on:
   workflow_dispatch:
@@ -168,7 +168,12 @@ jobs:
           name: model-artifacts
           path: artifacts
 
-      - name: 📝 Create inference Dockerfile (CPU)
+      - name: � Convert repository name to lowercase
+        id: repo-lowercase
+        run: |
+          echo "repository=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: �📝 Create inference Dockerfile (CPU)
         run: |
           mkdir -p docker
           cat > docker/Inference.Dockerfile <<'EOF'
@@ -214,8 +219,8 @@ jobs:
           file: docker/Inference.Dockerfile
           push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository }}:${{ env.INFER_TAG }}
-            ${{ env.REGISTRY }}/${{ github.repository }}:latest
+            ${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:${{ env.INFER_TAG }}
+            ${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
@@ -224,7 +229,7 @@ jobs:
       - name: 💾 Save image as tar (artifact) when not pushing
         if: ${{ !(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
         run: |
-          docker save ${{ env.REGISTRY }}/${{ github.repository }}:${{ env.INFER_TAG }} -o inference-image.tar
+          docker save ${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:${{ env.INFER_TAG }} -o inference-image.tar
 
       - name: 📦 Upload inference image artifact (tar)
         if: ${{ !(github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')) }}
@@ -247,17 +252,22 @@ jobs:
           name: model-artifacts
           path: artifacts
 
-      - name: 🔽 Pull image (if pushed)
+      - name: � Convert repository name to lowercase
+        id: repo-lowercase
+        run: |
+          echo "repository=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      - name: �🔽 Pull image (if pushed)
         if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master') }}
         run: |
-          docker pull ${{ env.REGISTRY }}/${{ github.repository }}:${{ env.INFER_TAG }}
+          docker pull ${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:${{ env.INFER_TAG }}
 
       - name: 📊 Run container and compute latency metrics
         run: |
-          IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:${{ env.INFER_TAG }}
+          IMAGE=${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:${{ env.INFER_TAG }}
           # Якщо образ не у реєстрі (PR), спробуємо локальний тег
           if ! docker inspect "$IMAGE" > /dev/null 2>&1; then
-            IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:latest
+            IMAGE=${{ env.REGISTRY }}/${{ steps.repo-lowercase.outputs.repository }}:latest
           fi
           if ! docker inspect "$IMAGE" > /dev/null 2>&1; then
             echo "Falling back to locally built image"
